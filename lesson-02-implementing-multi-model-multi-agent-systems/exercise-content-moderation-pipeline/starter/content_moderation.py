@@ -35,6 +35,7 @@ Tech Stack:
 
 import json
 import os
+import re
 import time
 import logging
 from dotenv import load_dotenv
@@ -44,6 +45,10 @@ from strands.models import BedrockModel
 load_dotenv()
 
 logging.basicConfig(level=logging.WARNING)
+
+def clean_response(text: str) -> str:
+    """Strip <thinking>...</thinking> tags from Nova model outputs."""
+    return re.sub(r"<thinking>.*?</thinking>\s*", "", text, flags=re.DOTALL).strip()
 
 # ─────────────────────────────────────────────────────
 # CONFIGURATION — Three different models
@@ -102,6 +107,21 @@ review_cache = {}
 def build_screening_agent() -> Agent:
     """Build the Screening Agent using Nova Lite for fast initial classification."""
 
+    model = BedrockModel(
+           model_id=NOVA_LITE_MODEL,
+           region_name=AWS_REGION,
+           temperature=0.0,
+        )
+    
+    #System prompt for the agent
+    
+    system_prompt =""" You are a content screening agent. Your ONLY job:
+        1. Call screen_post with the post_id.
+        2. Report: Classification (SAFE|HARMFUL|BORDERLINE) and
+        Confidence (HIGH|MEDIUM|LOW).
+        Do NOT add any other commentary. 
+        Only return the JSON output from screen_post."""
+
     # The tool is pre-written for you ──────────────────────
 
     @tool
@@ -121,12 +141,17 @@ def build_screening_agent() -> Agent:
 
         text_lower = post["text"].lower()
 
+        # check harmful keywords 
         if any(kw in text_lower for kw in HARMFUL_KEYWORDS):
             classification = "harmful"
             confidence = 0.95
+
+        # check borderline keywords    
         elif any(kw in text_lower for kw in BORDERLINE_KEYWORDS):
             classification = "borderline"
             confidence = 0.50
+
+        #default safe    
         else:
             classification = "safe"
             confidence = 0.90
@@ -141,6 +166,10 @@ def build_screening_agent() -> Agent:
         screening_cache[post_id] = result
         return json.dumps(result, indent=2)
 
+    # build agent - bind model +prompt + tool
+    return Agent(model=model, system_prompt=system_prompt, tools=[screen_post])  
+    
+
     # ── TODO 1 ─────────────────────────────────────────────
     # Create a BedrockModel using NOVA_LITE_MODEL for fast screening.
     # Then write a system prompt telling the agent to:
@@ -149,9 +178,7 @@ def build_screening_agent() -> Agent:
     # Finally, return an Agent with the model, prompt, and tools=[screen_post]
     #
     # Hint: Use temperature=0.0 for deterministic classification
-    # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
-
+    # ─────────────────────────────────────────────────────── 
 
 # ═══════════════════════════════════════════════════════
 #  AGENT 2: DEEP REVIEW AGENT  (Claude — nuanced analysis)
@@ -159,6 +186,19 @@ def build_screening_agent() -> Agent:
 
 def build_review_agent() -> Agent:
     """Build the Deep Review Agent using Claude for borderline case analysis."""
+
+    model = BedrockModel(
+        model_id=CLAUDE_MODEL,
+        region_name=AWS_REGION,
+        temperature=0.1,
+    )
+
+    #System prompt for the agent
+    system_prompt = """You are a content review agent. Your ONLY job:
+    1. Call deep_review_post with the post_id.
+    2. Report: Verdict (SAFE|HARMFUL) and one-sentence Reason
+    (one-sentence explanation)
+    Be precise. Borderline posts need a clear final call."""   
 
     # The tool is pre-written for you ──────────────────────
 
@@ -194,6 +234,9 @@ def build_review_agent() -> Agent:
         review_cache[post_id] = result
         return json.dumps(result, indent=2)
 
+    # build agent - bind model +prompt + tool
+    return Agent(model=model, system_prompt=system_prompt, tools=[deep_review_post])
+
     # ── TODO 2 ─────────────────────────────────────────────
     # Create a BedrockModel using CLAUDE_MODEL for deep analysis.
     # Then write a system prompt telling the agent to:
@@ -203,7 +246,6 @@ def build_review_agent() -> Agent:
     #
     # Hint: Use temperature=0.1 for analytical consistency
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
 
 
 # ═══════════════════════════════════════════════════════
@@ -212,6 +254,23 @@ def build_review_agent() -> Agent:
 
 def build_notice_agent() -> Agent:
     """Build the Notice Agent using Nova Pro for moderation communications."""
+
+    model = BedrockModel(
+        model_id=NOVA_PRO_MODEL,
+        region_name=AWS_REGION,
+        temperature=0.3,
+    )
+
+    #System prompt for the agent
+    system_prompt = """You are a moderation notice agent.
+    Your ONLY job:
+    1. Call generate_notice with post_id and violation_type.
+    2. Report the notice in exactly 3 lines:
+       - Action (REMOVED|FLAGGED)
+       - Notice to @user: (the moderation message)
+       - Reason: (brief reason)
+    Be professional and concise. 
+    Do NOT add any other commentary."""
 
     # The tool is pre-written for you ──────────────────────
 
@@ -242,6 +301,9 @@ def build_notice_agent() -> Agent:
             "text_preview": post["text"][:60],
         }, indent=2)
 
+    # build agent - bind model +prompt + tool
+    return Agent(model=model, system_prompt=system_prompt, tools=[generate_notice])
+
     # ── TODO 3 ─────────────────────────────────────────────
     # Create a BedrockModel using NOVA_PRO_MODEL for notice drafting.
     # Then write a system prompt telling the agent to:
@@ -251,7 +313,7 @@ def build_notice_agent() -> Agent:
     #
     # Hint: Use temperature=0.3 for slightly creative communication
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+
 
 
 # ═══════════════════════════════════════════════════════
