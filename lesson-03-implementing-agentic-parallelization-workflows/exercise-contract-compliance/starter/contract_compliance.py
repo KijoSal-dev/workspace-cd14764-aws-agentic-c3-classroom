@@ -201,13 +201,23 @@ ip_cache = {}
 # ═══════════════════════════════════════════════════════
 
 def build_regulatory_agent() -> Agent:
-    """Build the Regulatory Compliance Agent using Nova Lite.
+    """Build the Regulatory Compliance Agent using Nova Lite."""
 
-    Follow the same 3 steps shown in the demo (document_analysis.py):
-      STEP 1 → TODO 1: Create BedrockModel with Nova Lite
-      STEP 2 → TODO 2: Write system prompt
-      STEP 3 → TODO 3: Build Agent
-    """
+    #BedrockModel with Nova Lite
+
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region=AWS_REGION, temperature=0.0)
+
+    #System prompt
+    
+    system_prompt = """You are a Regulatory Compliance Specialist.
+    Your ONLY job:
+    1. Call check_regulatory with the contract_id
+    2. Report in exactly 3 lines:
+    Risk Level: <HIGH|MEDIUM|LOW>
+    Violations: <count or NONE>
+    Recommendation: <one-sentence>
+    Do NOT add any other commentary."""
+
 
     # TODO 1: Create BedrockModel with Nova Lite (same as demo STEP 1)
     # - Use NOVA_LITE_MODEL for fast regulatory checklist verification
@@ -256,7 +266,8 @@ def build_regulatory_agent() -> Agent:
 
     # TODO 3: Build Agent — bind model + prompt + tools (same as demo STEP 3)
     # return Agent(model=model, system_prompt=system_prompt, tools=[check_regulatory])
-    pass  # Remove this line when you complete the TODOs
+    return Agent(model=model, system_prompt=system_prompt, tools=[check_regulatory])
+    
 
 
 # ═══════════════════════════════════════════════════════
@@ -264,13 +275,20 @@ def build_regulatory_agent() -> Agent:
 # ═══════════════════════════════════════════════════════
 
 def build_financial_agent() -> Agent:
-    """Build the Financial Risk Agent using Claude.
+    """Build the Financial Risk Agent using Claude."""
 
-    Follow the same 3 steps shown in the demo (document_analysis.py):
-      STEP 1 → TODO 4: Create BedrockModel with Claude
-      STEP 2 → TODO 5: Write system prompt
-      STEP 3 → TODO 6: Build Agent
-    """
+    # BedrockModel with Claude
+    model = BedrockModel(model_id=CLAUDE_MODEL, region=AWS_REGION, temperature=0.1)
+
+    # System prompt
+    system_prompt = """You are a Financial Risk Specialist.
+    Your ONLY job:
+    1. Call assess_financial_risk with the contract_id
+    2. Report in exactly 3 lines:
+    Risk Level: <HIGH|MEDIUM|LOW>
+    Unfavorable Terms: <count or NONE>
+    Recommendation: <one-sentence>
+    Do NOT add any other commentary."""
 
     # TODO 4: Create BedrockModel with Claude (same as demo STEP 1)
     # - Use CLAUDE_MODEL for deep analysis of complex financial terms
@@ -319,21 +337,27 @@ def build_financial_agent() -> Agent:
 
     # TODO 6: Build Agent — bind model + prompt + tools (same as demo STEP 3)
     # return Agent(model=model, system_prompt=system_prompt, tools=[assess_financial_risk])
-    pass  # Remove this line when you complete the TODOs
-
+    return Agent(model=model, system_prompt=system_prompt, tools=[assess_financial_risk])
 
 # ═══════════════════════════════════════════════════════
 #  SPECIALIST 3: IP PROTECTION  (Nova Pro — balanced)
 # ═══════════════════════════════════════════════════════
 
 def build_ip_agent() -> Agent:
-    """Build the IP Protection Agent using Nova Pro.
+    """Build the IP Protection Agent using Nova Pro."""
 
-    Follow the same 3 steps shown in the demo (document_analysis.py):
-      STEP 1 → TODO 7: Create BedrockModel with Nova Pro
-      STEP 2 → TODO 8: Write system prompt
-      STEP 3 → TODO 9: Build Agent
-    """
+    # BedrockModel with Nova Pro
+    model = BedrockModel(model_id=NOVA_PRO_MODEL, region=AWS_REGION, temperature=0.1)
+
+    # System prompt
+    system_prompt = """You are an IP Protection Specialist.
+    Your ONLY job:
+    1. Call review_ip_clauses with the contract_id
+    2. Report in exactly 3 lines:
+    Risk Level: <HIGH|MEDIUM|LOW>
+    IP Concerns: <count or NONE>
+    Recommendation: <one-sentence>
+    Do NOT add any other commentary."""
 
     # TODO 7: Create BedrockModel with Nova Pro (same as demo STEP 1)
     # - Use NOVA_PRO_MODEL for balanced IP clause analysis
@@ -381,7 +405,7 @@ def build_ip_agent() -> Agent:
 
     # TODO 9: Build Agent — bind model + prompt + tools (same as demo STEP 3)
     # return Agent(model=model, system_prompt=system_prompt, tools=[review_ip_clauses])
-    pass  # Remove this line when you complete the TODOs
+    return Agent(model=model, system_prompt=system_prompt, tools=[review_ip_clauses])
 
 
 # ═══════════════════════════════════════════════════════
@@ -393,13 +417,22 @@ def build_ip_agent() -> Agent:
 # ═══════════════════════════════════════════════════════
 
 def build_synthesizer_agent() -> Agent:
-    """Build the Synthesizer Agent using Claude.
+    """Build the Synthesizer Agent using Claude."""
 
-    Follow the same 3 steps shown in the demo (document_analysis.py):
-      STEP 1 → TODO 10: Create BedrockModel with Claude
-      STEP 2 → TODO 11: Write system prompt
-      STEP 3 → TODO 12: Build Agent
-    """
+    # BedrockModel with Claude
+    model = BedrockModel(model_id=CLAUDE_MODEL, region=AWS_REGION, temperature=0.2)
+
+    # System prompt
+    system_prompt = """You are a Contract Compliance Synthesizer.
+    Your Only job:
+    1. Call synthesize_compliance with the contract_id
+    2. Report a unified assessment in exactly 5 lines:
+    Overall Risk: <HIGH|MEDIUM|LOW>
+    Recommendation: <APPROVE|APPROVE-WITH-CONDITIONS|REJECT
+    Regulatory: <one-line summary>
+    Financial: <one-line summary>
+    IP Protection: <one-line summary>
+    Do NOT re-analyze the contract. Use ONLY the specialist findings>"""
 
     # TODO 10: Create BedrockModel with Claude (same as demo STEP 1)
     # - Use CLAUDE_MODEL for reasoning across multiple specialist outputs
@@ -477,8 +510,8 @@ def build_synthesizer_agent() -> Agent:
 
     # TODO 12: Build Agent — bind model + prompt + tools (same as demo STEP 3)
     # return Agent(model=model, system_prompt=system_prompt, tools=[synthesize_compliance])
-    pass  # Remove this line when you complete the TODOs
-
+    return Agent(model=model, system_prompt=system_prompt, tools=[synthesize_compliance])
+   
 
 # ═══════════════════════════════════════════════════════
 #  PARALLEL EXECUTION ENGINE (pre-written)
