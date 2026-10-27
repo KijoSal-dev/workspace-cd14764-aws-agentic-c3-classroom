@@ -163,7 +163,21 @@ customer_memory = {}
 #   - Return the record
 #   Hint: Same as demo's create_trip(), but with order fields
 def create_order(order_data: dict) -> dict:
-    pass
+    """STEP 1: Create initial order state (version 0 , TTL 2 hours)."""
+    order_id = order_data["order_id"]
+    now = time.time()
+    record = {
+        "order_id": order_id, "customer_id": order_data["customer_id"], "customer_name":order_data["customer_name"],
+        "restaurant": order_data["restaurant"], "items": order_data["items"], "address": order_data["address"],
+        "payment_method": order_data["payment_method"], "driver": None, "total_price": None,
+        "status": "pending", "progress":[], "version":0, "ttl":(now + 7200),
+        "created_at": datatime.now(timezone.utc).isoformat(),
+    }
+    order_table.put_item(Item=to_dynamo(record))
+    _write_log.append({"op":"put_item", "pk":order_id, "version":0, "timestamp": time.time()})
+    return record
+
+
 
 
 # TODO 2: Implement update_order(order_id, updates, max_retries=3)
@@ -176,7 +190,65 @@ def create_order(order_data: dict) -> dict:
 #   - Return the updated record (converted with from_dynamo)
 #   Hint: Same as demo's update_trip() — the KEY pattern
 def update_order(order_id: str, updates: dict, max_retries: int = 3) -> dict:
-    pass
+    """
+    THE KEY PATTERN: Optimistic locking with retry.
+    
+    Same pattern as the demo's update_trip() - every agent calls this to
+    write its piece of the shared order record.
+    Three steps: READ the current version → MODIFY locally → WRITE with a
+    version condition. If another agent wrote first, DynamoDB rejects the
+    write and we retry from step 1 with the fresh version.
+    """
+    for attempt in range(max_retries):
+         # STEP 1 — READ: fetch the current record and capture its version.
+                # This version number is our "lock token" — we must return it when writing.
+                response = order_table.get_item(Key={"order_id": order_id})
+                current = response.get("Item")
+                if not current:
+                    raise KeyError(f"Order {order_id} not found")
+                expected_version = int(current["version"])   # e.g. version = 2
+        
+                # STEP 2 — MODIFY: apply the agent's updates locally and bump the version.
+                # Nothing is written to DynamoDB yet — this is all in memory.
+                current.update(to_dynamo(updates))
+                current["version"] = expected_version + 1    # e.g. version 2 → 3
+                current["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
+                try:
+                    # STEP 3 — WRITE: put the updated record back with a condition.
+                    # ConditionExpression = "version = :expected_ver" is the atomic check:
+                    #   DynamoDB compares the stored version to our expected_version.
+                    #   If they match  → write succeeds (we still have the latest version).
+                    #   If they differ → ConditionalCheckFailedException (another agent wrote first).
+                    order_table.put_item(
+                        Item=current,
+                        ConditionExpression="version = :expected_ver",
+                        ExpressionAttributeValues={":expected_ver": expected_version},
+                    )
+                    # SUCCESS: write went through — log it and return the updated record.
+                    _write_log.append({"op": "update_item", "pk": order_id,
+                        "version": f"{expected_version} → {expected_version + 1}",
+                        "fields": list(updates.keys()), "timestamp": time.time()})
+                    return from_dynamo(current)
+        
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                        # CONFLICT: another agent incremented the version between our READ and WRITE.
+                        # Our expected_version is now stale — we can't write safely.
+                        # Solution: log the conflict, wait briefly, then loop back to STEP 1
+                        # to re-read the record and get the new current version.
+                        _write_log.append({"op": "CONFLICT", "pk": order_id,
+                            "expected": expected_version, "timestamp": time.time()})
+                        if attempt < max_retries - 1:
+                            wait = 0.1 * (2 ** attempt)   # exponential backoff: 0.1s, 0.2s, 0.4s
+                            print(f"      [Conflict] Version conflict — retrying in {wait:.1f}s (attempt {attempt + 1})")
+                            time.sleep(wait)
+                        else:
+                            print(f"      [Failed] Version conflict after {max_retries} retries")
+                            raise VersionConflictError(f"Version conflict after {max_retries} retries")
+                    else:
+                        raise
+
 
 
 # TODO 3: Implement get_order(order_id)
@@ -184,7 +256,11 @@ def update_order(order_id: str, updates: dict, max_retries: int = 3) -> dict:
 #   - Return from_dynamo(item) if item else None
 #   Hint: Same as demo's get_trip()
 def get_order(order_id: str) -> dict | None:
-    pass
+    """STEP 3: Read current order state."""
+    response = order_table.get_item(Key={"order_id":order_id})
+    item = response.get("Item")
+    return from_dynamo(item) if item else None
+    
 
 
 # TODO 4: Implement recover_order(order_id) — NEW pattern, not in demo
@@ -194,17 +270,33 @@ def get_order(order_id: str) -> dict | None:
 #   - Return the cleaned-up record
 #   Hint: Handles case where some agents wrote partial data before restaurant rejected
 def recover_order(order_id: str) -> dict:
-    pass
+    """STEP 4 (NEW): STATE RECOVERY - Clean up after restaurant rejection."""
+    print(f"      [Recovery] Cleaning up partial state for {order_id}...")
+    result = update_order(order_id, {
+        "driver": None, "total_price": None, "status": "cancelled",
+        "progress": ["Order rejected by restaurant", "Partial updates cleaned up"],
+    })
+    print(f"       [Recovery] Order {order_id} → cancelled(v{result['version']})")
+    return result
+    
 
 
 # TODO 5-7: Build RestaurantConfirmAgent
 def build_restaurant_confirm_agent(simulate_rejection: bool = False) -> Agent:
     """Worker: Restaurant confirms or rejects the order."""
     # TODO 5: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(
+        model_id=NOVA_LITE_MODEL,
+        region_name=AWS_REGION,
+        temperature=0.0
+    )
 
     # TODO 6: Write system prompt — agent calls confirm_order, reports "<order_id> confirmed/rejected"
-    system_prompt = ""  # Replace with system prompt
+    system_prompt = """You are a restaurant confirmation agent.
+    Your ONLY job:
+    1. Call confirm_order with the order_id
+    2. Report: Order <order_id> <confirmed/rejcted> by restaurant
+    Do NOT add any other commentary."""
 
     @tool
     def confirm_order(order_id: str) -> str:
@@ -219,17 +311,25 @@ def build_restaurant_confirm_agent(simulate_rejection: bool = False) -> Agent:
         return json.dumps(result, indent=2)
 
     # TODO 7: Build and return Agent with model, system_prompt, tools=[confirm_order]
-    return None  # Replace with Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tools=[confirm_order])
 
 
 # TODO 8-10: Build DriverAssignAgent
 def build_driver_assign_agent() -> Agent:
     """Worker: Assigns a delivery driver."""
     # TODO 8: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(
+        model_id=NOVA_LITE_MODEL,
+        region_name=AWS_REGION,
+        temperature=0.0
+    )
 
     # TODO 9: Write system prompt — agent calls assign_driver, reports "Driver <name> assigned"
-    system_prompt = ""  # Replace with system prompt
+    system_prompt = """You are a driver assignment agent.
+    Your ONLY job:
+    1. Call assign_driver with the order_id
+    2. Report: Driver <name> assigned for <order_id>
+    Do NOT add any other commentary."""
 
     @tool
     def assign_driver(order_id: str) -> str:
@@ -257,17 +357,25 @@ def build_driver_assign_agent() -> Agent:
         return json.dumps({**driver_info, "order_id": order_id}, indent=2)
 
     # TODO 10: Build and return Agent with model, system_prompt, tools=[assign_driver]
-    return None  # Replace with Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tool=[assign_driver])
 
 
 # TODO 11-13: Build PriceCalculatorAgent
 def build_price_calculator_agent() -> Agent:
     """Worker: Calculates total price with delivery fee and tax."""
     # TODO 11: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(
+        model_id=NOVA_LITE_MODEL,
+        region_name=AWS_REGION,
+        temperature=0.0
+    )
 
     # TODO 12: Write system prompt — agent calls calculate_price, reports "Total for <order_id>: $<amount>"
-    system_prompt = ""  # Replace with system prompt
+    system_prompt = """You are a price calculation agent.
+    Your ONLY job:
+    1. Call calculate_price with the order_id
+    2. Report: Total for <order_id>: $<amount>
+    Do NOT add any other commentary."""
 
     @tool
     def calculate_price(order_id: str) -> str:
@@ -283,17 +391,25 @@ def build_price_calculator_agent() -> Agent:
         return json.dumps({**price_info, "order_id": order_id}, indent=2)
 
     # TODO 13: Build and return Agent with model, system_prompt, tools=[calculate_price]
-    return None  # Replace with Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tools=[calculate_price])
 
 
 # TODO 14-16: Build StatusTrackerAgent
 def build_status_tracker_agent() -> Agent:
     """Worker: Updates order progress/status."""
     # TODO 14: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(
+        model_id=NOVA_LITE_MODEL,
+        region_name=AWS_REGION,
+        temparature=0.0
+    )
 
     # TODO 15: Write system prompt — agent calls update_status, reports "Status for <order_id>: <status>"
-    system_prompt = ""  # Replace with system prompt
+    system_prompt = """You are a status tracking agent.
+    Your ONLY job:
+    1. Call update_status with the order_id
+    2. Report: Status for <order_id>: <status>
+    Do NOT add any other commentary."""
 
     @tool
     def update_status(order_id: str) -> str:
@@ -308,7 +424,7 @@ def build_status_tracker_agent() -> Agent:
         return json.dumps({"order_id": order_id, "status": new_status, "progress_count": len(progress)}, indent=2)
 
     # TODO 16: Build and return Agent with model, system_prompt, tools=[update_status]
-    return None  # Replace with Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tools=[update_status])
 
 
 # TODO 17-18: Wire up scenarios in main()
@@ -332,7 +448,35 @@ def main():
     print(f"  Items: {items_str} | Customer: {order1['customer_name']}")
     print(f"{'━' * 70}")
 
-    pass  # Replace with sequential scenario implementation
+    record1 = create_order(order1)
+    print(f"\n  Created: {order1['order_id']} (version {record1['version']}),"
+          f"TTL: {datetime.fromtimestamp(record1['ttl'], tz=timezone.utc).strftime('%H:%M:%S UTC')}")
+
+    print(f"\n  [1/4] RestaurantConfirmAgent...")
+    t1 = run_agent_with_retry(lambda: build_restaurant_confirm_agent(False), f"Confirm order {order1['order_id']}")
+    state = get_order(order1["order_id"])
+    print(f"    Status: {state['status']} (v{state['version']}, {t1:.1f}s)")
+    
+    print(f"  [2/4] DriverAssignAgent...")
+    t2 = run_agent_with_retry(build_driver_assign_agent, f"Assign driver for order {order1['order_id']}")
+    state = get_order(order1["order_id"])
+    print(f"    Driver: {state['driver']['name']} (v{state['version']}, {t2:.1f}s)")
+    
+    print(f"  [3/4] PriceCalculatorAgent...")
+    t3 = run_agent_with_retry(build_price_calculator_agent, f"Calculate price for order {order1['order_id']}")
+    state = get_order(order1["order_id"])
+    print(f"    Total: ${state['total_price']['total']:.2f} (v{state['version']}, {t3:.1f}s)")
+    
+    print(f"  [4/4] StatusTrackerAgent...")
+    t4 = run_agent_with_retry(build_status_tracker_agent, f"Update status for order {order1['order_id']}")
+    state = get_order(order1["order_id"])
+    print(f"    Status: {state['status']} (v{state['version']}, {t4:.1f}s)")
+    
+    print(f"\n  Final State: {state['order_id']} v{state['version']}")
+    print(f"    Status: {state['status']} | Restaurant: {state['restaurant']}")
+    print(f"    Driver: {state['driver']['name']} ({state['driver']['vehicle']})")
+    tp = state['total_price']
+    print(f"    Subtotal: ${tp['subtotal']:.2f} + Tax: ${tp['tax']:.2f} + Delivery: ${tp['delivery_fee']:.2f} = ${tp['total']:.2f}")
 
     # TODO 18: Concurrent scenario (Scenario 2)
     #   a) Create order2, print version
@@ -348,7 +492,40 @@ def main():
     print(f"  All 4 agents run in PARALLEL — expect version conflicts!")
     print(f"{'━' * 70}")
 
-    pass  # Replace with concurrent scenario implementation
+    record2 = create_order(order2)
+    print(f"\n  Created: {order2['order_id']} (version {record2['version']})")
+    conflicts_before = sum(1 for e in _write_log if e["op"] == "CONFLICT")
+    
+    print(f"  Launching 4 agents in parallel...")
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(run_agent_with_retry, lambda: build_restaurant_confirm_agent(False),
+                              f"Confirm order {order2['order_id']}"): "Restaurant",
+                executor.submit(run_agent_with_retry, build_driver_assign_agent,
+                              f"Assign driver for order {order2['order_id']}"): "Driver",
+                executor.submit(run_agent_with_retry, build_price_calculator_agent,
+                              f"Calculate price for order {order2['order_id']}"): "Price",
+                executor.submit(run_agent_with_retry, build_status_tracker_agent,
+                              f"Update status for order {order2['order_id']}"): "Status",
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    pass
+    
+    t_parallel = time.time() - t_start
+    conflicts_after = sum(1 for e in _write_log if e["op"] == "CONFLICT")
+    new_conflicts = conflicts_after - conflicts_before
+    
+    state2 = get_order(order2["order_id"])
+    print(f"\n  Final State: {state2['order_id']} v{state2['version']}")
+    print(f"    Status: {state2['status']} | Driver: {state2['driver']['name'] if state2.get('driver') else '?'}")
+    tp2 = state2.get('total_price')
+    print(f"    Total: ${tp2['total']:.2f}" if tp2 else "    Total: ?")
+    print(f"    Conflicts: {new_conflicts} | All resolved: {'YES' if state2.get('driver') and state2.get('total_price') else 'NO'} | Time: {t_parallel:.1f}s")
+    
 
     # SCENARIO 3: State Recovery (restaurant rejection) — provided for you
     order3 = ORDERS[2]
