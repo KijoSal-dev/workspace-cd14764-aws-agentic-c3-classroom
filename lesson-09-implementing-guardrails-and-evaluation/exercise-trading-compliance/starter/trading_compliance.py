@@ -123,9 +123,51 @@ bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 def apply_guardrail(text: str, direction: str = "INPUT") -> dict:
     """
     Apply Bedrock Guardrail to text content using bedrock-runtime.apply_guardrail() API.
+
+    Args:
+        text: Content to evaluate
+        direction: "INPUT" for user messages, "OUTPUT" for model responses
+
+    Returns:
+           Dict with {action, assessments, guardrail_id, direction, timestamp}            
     """
-    # Replace with real Bedrock API call
-    return {"action": "ALLOWED", "direction": direction, "guardrail_id": None, "assessments": []}
+    if not GUARDRAIL_ID:
+        print("     WARNING: GUARDRAIL_ID not set — skipping guardrail check")
+        return {"action": "ALLOWED", "direction": direction, "guardrail_id": None, "direction": direction}
+
+    try:
+        response = bedrock_runtime.apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VERSION,
+            source=direction,
+            content=[{"text": {"text": text}}],
+        )
+
+        action = response.get("action", "NONE")
+        assessments = response.get("assessments", [])
+
+        # Map Bedrock response to simplified result
+        result = {
+            "action": "BLOCKED" if action == "GUARDRAIL_INTERVENED" else "ALLOWED",
+            "direction": direction,
+            "guardrail_id": GUARDRAIL_ID,
+            "assessments": assessments,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        return result
+    except Exception as e:
+        print(f"   WARNING: Guardrail API error — {e}")
+        # Fail open: allow request if quardrail unavailable
+        return {
+            "action": "ALLOWED",
+            "direction": direction,
+            "guardrail_id": GUARDRAIL_ID,
+            "assessments": [],
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
 
 
 # KILL SWITCH
@@ -144,6 +186,7 @@ class KillSwitch:
         self.window_seconds = window_seconds
         self.violations = []  # Timestamps of guardrail violations
         self.is_triggered = False
+        self.cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
         # TODO 2: Add CloudWatch client and emit_metric() logic
         #   Hint: self.cw = boto3.client("cloudwatch", region_name=AWS_REGION)
         #   Hint: record_violation() should append time.time(), emit a CloudWatch metric,
@@ -152,11 +195,32 @@ class KillSwitch:
     def record_violation(self):
         """Record violation and check threshold."""
         # TODO 2: Append current time, emit CloudWatch metric, check if threshold exceeded
-        pass
+        now = time.time()
+        self.violations.append(now)
+
+        # Emit metric to CloudWatch
+        try:
+            self.cloudwatch.put_metric_data(
+                Namespace="Lesson0/Guardrails",
+                MetricData=[{
+                    "MetricName": "GuardrailViolations",
+                    "Value": 1,
+                    "Unit": "Count"
+                }], 
+            )
+
+        except Exception:
+            pass
+
+        # Check violation count in window
+        cutoff = now - self.window_seconds
+        recent = [v for v in self.violations if v > cutoff]
+        if len(recent) >= self.max_violations:
+            self.is_triggered = True    
 
     def check(self) -> bool:
         # TODO 2: Return is_triggered
-        return False
+        return self.is_triggered
 
 
 # RATE LIMITER
@@ -175,7 +239,15 @@ class RateLimiter:
     # TODO 3: Implement allow_request() using token bucket
     def allow_request(self) -> bool:
         # Hint: Calculate elapsed time, refill tokens at self.rate, consume 1 if available
-        return True  # Replace with token bucket logic
+        
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+        self.last_refill = now
+        if self.tokens >= 1:
+           self.tokens -= 1
+           return True
+        return False
 
 
 # METRICS DASHBOARD (provided)
@@ -294,7 +366,15 @@ Call score_response with your scores. Be strict but fair."""
 # Hint: Clear _eval_result, build evaluator, prompt with analyst input + agent response
 # Hint: Call evaluator(prompt), return _eval_result.copy()
 def evaluate_response(analyst_input: str, agent_response: str) -> dict:
-    """Evaluate a compliance agent response using LLM-as-judge."""
+    """Evaluate a compliance agent response using LLM-as-judge.
+    
+    Args:
+        analyst_input: The original analyst question
+        agent_response: The agent's response to evaluate 
+
+    Returns:
+        Dict with {compliance, relevance, safety, completeness, average}      
+    """
     _eval_result.clear()
     evaluator = build_evaluator_agent()
     prompt = f"""Evaluate this compliance agent response:
@@ -319,12 +399,18 @@ Score the response on compliance, relevance, safety, and completeness (1-5 each)
 def build_compliance_agent() -> Agent:
     """Build a financial trading compliance agent."""
     # TODO 4: Create BedrockModel for compliance agent. Hint: Use NOVA_LITE_MODEL, temperature=0.1
-    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.1)
-
     # TODO 5: Write system prompt. Hint: Factual regulatory info, no recommendations, no insider info, audit-ready
+        
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.1)
     system_prompt = """You are a financial trading compliance agent for a brokerage firm.
-Answer regulatory questions and review trading activity.
-RULES: (1) Factual regulatory info only (2) NO trade recommendations (3) NO insider info (4) Report violations (5) Professional & audit-ready"""
+    Answer regulatory questions and review trading activity
+    RULES: 
+    (1) Factual regulatory info only 
+    (2) NO trade recommendations 
+    (3) NO insider information
+    (4) Report violations
+    (5) Professional & audit-ready
+    """
 
     @tool
     def check_trading_rules(query: str) -> str:
@@ -413,11 +499,13 @@ def run_governance_pipeline(test_input: dict, rate_limiter: RateLimiter,
 
     # TODO 7: Check kill switch — if triggered, record killed metric and return {"action": "KILLED", ...}
     if kill_switch.check():
+        print(f"    KILL SWITCH ACTIVE — agent disabled, request rejected")
         dashboard.record_killed()
         return {"action": "KILLED", "policy": "KILL_SWITCH"}
 
     # TODO 8: Check rate limiter — if not allowed, record rate limited metric and return
     if not rate_limiter.allow_request():
+        print(f"     RATE LIMITED — 429 Too Many Requests")
         dashboard.record_rate_limited()
         return {"action": "RATE_LIMITED", "policy": "RATE_LIMITER"}
 
@@ -426,6 +514,9 @@ def run_governance_pipeline(test_input: dict, rate_limiter: RateLimiter,
     # Hint: If blocked: print message, record metric, record violation in kill switch, return
     input_result = apply_guardrail(text, direction="INPUT")
     if input_result["action"] == "BLOCKED":
+        assessments = input_result.get("assessments", [])
+        policy_hint = assessments[0].get("type", "UNKNOWN") if assessments else "UNKNOWN"
+        print(f"    INPUT BLOCKED by guardrail:{policy_hint}")
         dashboard.record(input_result)
         kill_switch.record_violation()
         return input_result
@@ -445,10 +536,9 @@ def run_governance_pipeline(test_input: dict, rate_limiter: RateLimiter,
         elapsed = time.time() - t_start
 
     # TODO 11: Apply output guardrail to scan agent response
+    # TODO 12: Record metrics and return agent_response
     # Hint: guardrail.apply_guardrail(agent_response_text or placeholder, "OUTPUT")
     output_result = apply_guardrail(agent_response_text if agent_response_text else "Agent response placeholder", direction="OUTPUT")
-
-    # TODO 12: Record metrics and return agent_response
     dashboard.record(input_result, latency=elapsed)
     return {**input_result, "latency": elapsed, "agent_response": agent_response_text}
 
